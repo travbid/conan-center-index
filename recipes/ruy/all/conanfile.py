@@ -1,8 +1,12 @@
 import os
-from conans import ConanFile, CMake, tools
-from conans.errors import ConanInvalidConfiguration
+from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
+from conan.tools.build import check_min_cppstd
+from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
+from conan.tools.files import get, replace_in_file, rm
+from conan.tools.scm import Version
 
-required_conan_version = ">=1.33.0"
+required_conan_version = ">=1.55.0"
 
 
 class RuyConan(ConanFile):
@@ -14,7 +18,6 @@ class RuyConan(ConanFile):
     license = "Apache-2.0"
     topics = ("matrix", "multiplication", "neural", "network", "AI", "tensorflow")
     exports_sources = "CMakeLists.txt"
-    generators = "cmake"
     settings = "os", "arch", "compiler", "build_type"
     options = {
         "shared": [True, False],
@@ -24,12 +27,6 @@ class RuyConan(ConanFile):
         "shared": False,
         "fPIC": True,
     }
-
-    _cmake = None
-
-    @property
-    def _source_subfolder(self):
-        return "source_subfolder"
 
     @property
     def _minimum_compilers_version(self):
@@ -42,17 +39,18 @@ class RuyConan(ConanFile):
 
     def validate(self):
         if self.settings.compiler.cppstd:
-            tools.check_min_cppstd(self, 14)
+            check_min_cppstd(self, 14)
 
         minimum_version = self._minimum_compilers_version.get(str(self.settings.compiler), False)
         if not minimum_version:
             self.output.warn("Compiler is unknown. Assuming it supports C++14.")
-        elif tools.Version(self.settings.compiler.version) < minimum_version:
+        elif Version(self.settings.compiler.version) < minimum_version:
             raise ConanInvalidConfiguration("Build requires support for C++14. Minimum version for {} is {}"
-                .format(str(self.settings.compiler), minimum_version))
+                                            .format(str(self.settings.compiler), minimum_version))
 
-        if str(self.settings.compiler) == "clang" and tools.Version(self.settings.compiler.version) <= 5 and self.settings.build_type == "Debug":
-            raise ConanInvalidConfiguration("Debug builds are not supported on older versions of Clang (<=5)")
+        if str(self.settings.compiler) == "clang" and Version(self.settings.compiler.version) <= "5" and self.settings.build_type == "Debug":
+            raise ConanInvalidConfiguration(
+                "Debug builds are not supported on older versions of Clang (<=5)")
 
     def config_options(self):
         if self.settings.os == "Windows":
@@ -62,54 +60,61 @@ class RuyConan(ConanFile):
         if self.options.shared:
             del self.options.fPIC
 
+    def layout(self):
+        cmake_layout(self, src_folder="src")
+
     def requirements(self):
         self.requires("cpuinfo/cci.20201217")
 
     def source(self):
-        tools.get(**self.conan_data["sources"][self.version],
-                destination=self._source_subfolder, strip_root=True)
+        get(self, **self.conan_data["sources"][self.version],
+            destination=self.source_folder, strip_root=True)
 
-    def _configure_cmake(self):
-        if self._cmake:
-            return self._cmake
-        self._cmake = CMake(self)
-        self._cmake.definitions["RUY_MINIMAL_BUILD"] = True
-        self._cmake.configure()
-        return self._cmake
+    def generate(self):
+        tc = CMakeToolchain(self)
+        tc.variables["RUY_MINIMAL_BUILD"] = True
+        tc.variables["RUY_ENABLE_INSTALL"] = True
+        tc.generate()
 
+        deps = CMakeDeps(self)
+        deps.generate()
 
     def build(self):
         # 1. Allow Shared builds
-        tools.replace_in_file(os.path.join(self._source_subfolder, "cmake", "ruy_cc_library.cmake"),
-                              "add_library(${_NAME} STATIC",
-                              "add_library(${_NAME}"
-                              )
+        replace_in_file(self, os.path.join(self.source_folder, "cmake", "ruy_cc_library.cmake"),
+                        "add_library(${_NAME} STATIC",
+                        "add_library(${_NAME}"
+                        )
+        replace_in_file(self, os.path.join(self.source_folder, "cmake", "ruy_cc_library.cmake"),
+                        "file(RELATIVE_PATH _SUBDIR ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_LIST_DIR})",
+                        "file(RELATIVE_PATH _SUBDIR ${CMAKE_SOURCE_DIR}/" +
+                        self.source_folder + " ${CMAKE_CURRENT_LIST_DIR})"
+                        )
 
         # 2. Shared builds fail with undefined symbols without this fix.
         # This is because ruy only links to 'cpuinfo' but it also needs 'clog' (from the same package)
         cpuinfoLibs = self.deps_cpp_info["cpuinfo"].libs + self.deps_cpp_info["cpuinfo"].system_libs
         libsListAsString = ";".join(cpuinfoLibs)
         if int(self.version.strip('cci.')) < 20220628:
-            tools.replace_in_file(os.path.join(self._source_subfolder, "ruy", "CMakeLists.txt"),
-                                  "set(ruy_6_cpuinfo \"cpuinfo\")",
-                                  f"set(ruy_6_cpuinfo \"{libsListAsString}\")"
-                                  )
+            replace_in_file(self, os.path.join(self.source_folder, "ruy", "CMakeLists.txt"),
+                            "set(ruy_6_cpuinfo \"cpuinfo\")",
+                            f"set(ruy_6_cpuinfo \"{libsListAsString}\")"
+                            )
         else:
-            tools.replace_in_file(os.path.join(self._source_subfolder, "ruy", "CMakeLists.txt"),
-                                  "set(ruy_6_cpuinfo_cpuinfo \"cpuinfo::cpuinfo\")",
-                                  f"set(ruy_6_cpuinfo_cpuinfo \"{libsListAsString}\")"
-                                  )
-
-        cmake = self._configure_cmake()
+            replace_in_file(self, os.path.join(self.source_folder, "ruy", "CMakeLists.txt"),
+                            "set(ruy_6_cpuinfo_cpuinfo \"cpuinfo::cpuinfo\")",
+                            f"set(ruy_6_cpuinfo_cpuinfo \"{libsListAsString}\")"
+                            )
+        cmake = CMake(self)
+        cmake.configure(build_script_folder=os.path.join(self.source_folder, os.pardir))
         cmake.build()
 
     def package(self):
-        self.copy("LICENSE", dst="licenses", src=self._source_subfolder)
-        self.copy(pattern="*.h", dst=os.path.join("include", "ruy"), src=os.path.join(self._source_subfolder, "ruy"))
-        self.copy(pattern="*", dst="lib", src="lib")
-        self.copy(pattern="*", dst="bin", src="bin")
+        cmake = CMake(self)
+        cmake.install()
 
-        tools.remove_files_by_mask(self.package_folder, "*.pdb")
+        self.copy("LICENSE", dst="licenses", src=self.source_folder)
+        rm(self, "*.pdb", self.package_folder)
 
     def package_info(self):
         self.cpp_info.libs = ["ruy_frontend",
